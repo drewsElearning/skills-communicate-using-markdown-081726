@@ -1,0 +1,358 @@
+name: Link PR to Open Issue and Log on Kanban
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - ready_for_review
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  # Update these for your GitHub Projects Kanban board.
+  # For org project: PROJECT_OWNER_TYPE=organization
+  # For user project: PROJECT_OWNER_TYPE=user
+  PROJECT_OWNER_TYPE: organization
+  PROJECT_OWNER: YOUR_ORG_OR_USER_NAME
+  PROJECT_NUMBER: 1
+
+  # Your Kanban status field and value.
+  # Example field: Status
+  # Example value: In Progress, Todo, Ready for Review
+  PROJECT_STATUS_FIELD: Status
+  PROJECT_STATUS_VALUE: In Progress
+
+jobs:
+  link-and-log:
+    name: Associate PR with linked issue and update Kanban
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find linked open issues
+        id: linked_issues
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          gh api graphql \
+            -F owner="$OWNER" \
+            -F repo="$REPO" \
+            -F pr="$PR_NUMBER" \
+            -f query='
+              query($owner: String!, $repo: String!, $pr: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    id
+                    number
+                    title
+                    url
+                    closingIssuesReferences(first: 20) {
+                      nodes {
+                        id
+                        number
+                        title
+                        state
+                        url
+                      }
+                    }
+                  }
+                }
+              }
+            ' > pr_linked_issues.json
+
+          jq -r '
+            .data.repository.pullRequest.closingIssuesReferences.nodes
+            | map(select(.state == "OPEN"))
+          ' pr_linked_issues.json > open_issues.json
+
+          OPEN_ISSUE_COUNT="$(jq 'length' open_issues.json)"
+          echo "open_issue_count=$OPEN_ISSUE_COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$OPEN_ISSUE_COUNT" -eq 0 ]; then
+            echo "No open linked issues found for this PR."
+            exit 0
+          fi
+
+          FIRST_ISSUE_NUMBER="$(jq -r '.[0].number' open_issues.json)"
+          FIRST_ISSUE_ID="$(jq -r '.[0].id' open_issues.json)"
+          FIRST_ISSUE_URL="$(jq -r '.[0].url' open_issues.json)"
+          FIRST_ISSUE_TITLE="$(jq -r '.[0].title' open_issues.json)"
+
+          echo "issue_number=$FIRST_ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "issue_id=$FIRST_ISSUE_ID" >> "$GITHUB_OUTPUT"
+          echo "issue_url=$FIRST_ISSUE_URL" >> "$GITHUB_OUTPUT"
+          echo "issue_title<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FIRST_ISSUE_TITLE" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if no open linked issue exists
+        if: steps.linked_issues.outputs.open_issue_count == '0'
+        run: |
+          echo "PR is not linked to any open issue. Nothing to log on the Kanban board."
+
+      - name: Get GitHub Project data
+        if: steps.linked_issues.outputs.open_issue_count != '0'
+        id: project_data
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          PROJECT_OWNER_TYPE: ${{ env.PROJECT_OWNER_TYPE }}
+          PROJECT_OWNER: ${{ env.PROJECT_OWNER }}
+          PROJECT_NUMBER: ${{ env.PROJECT_NUMBER }}
+          PROJECT_STATUS_FIELD: ${{ env.PROJECT_STATUS_FIELD }}
+          PROJECT_STATUS_VALUE: ${{ env.PROJECT_STATUS_VALUE }}
+        run: |
+          set -euo pipefail
+
+          if [ "$PROJECT_OWNER_TYPE" = "organization" ]; then
+            gh api graphql \
+              -F owner="$PROJECT_OWNER" \
+              -F number="$PROJECT_NUMBER" \
+              -f query='
+                query($owner: String!, $number: Int!) {
+                  organization(login: $owner) {
+                    projectV2(number: $number) {
+                      id
+                      fields(first: 50) {
+                        nodes {
+                          ... on ProjectV2Field {
+                            id
+                            name
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options {
+                              id
+                              name
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ' > project_data.json
+
+            PROJECT_ID="$(jq -r '.data.organization.projectV2.id' project_data.json)"
+          else
+            gh api graphql \
+              -F owner="$PROJECT_OWNER" \
+              -F number="$PROJECT_NUMBER" \
+              -f query='
+                query($owner: String!, $number: Int!) {
+                  user(login: $owner) {
+                    projectV2(number: $number) {
+                      id
+                      fields(first: 50) {
+                        nodes {
+                          ... on ProjectV2Field {
+                            id
+                            name
+                          }
+                          ... on ProjectV2SingleSelectField {
+                            id
+                            name
+                            options {
+                              id
+                              name
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ' > project_data.json
+
+            PROJECT_ID="$(jq -r '.data.user.projectV2.id' project_data.json)"
+          fi
+
+          STATUS_FIELD_ID="$(jq -r --arg field "$PROJECT_STATUS_FIELD" '
+            .data[]?.projectV2.fields.nodes[]
+            | select(.name == $field)
+            | .id
+          ' project_data.json | head -n 1)"
+
+          STATUS_OPTION_ID="$(jq -r --arg field "$PROJECT_STATUS_FIELD" --arg value "$PROJECT_STATUS_VALUE" '
+            .data[]?.projectV2.fields.nodes[]
+            | select(.name == $field)
+            | .options[]
+            | select(.name == $value)
+            | .id
+          ' project_data.json | head -n 1)"
+
+          if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+            echo "Could not find the GitHub Project. Check PROJECT_OWNER_TYPE, PROJECT_OWNER, and PROJECT_NUMBER."
+            exit 1
+          fi
+
+          if [ -z "$STATUS_FIELD_ID" ] || [ "$STATUS_FIELD_ID" = "null" ]; then
+            echo "Could not find Kanban field: $PROJECT_STATUS_FIELD"
+            exit 1
+          fi
+
+          if [ -z "$STATUS_OPTION_ID" ] || [ "$STATUS_OPTION_ID" = "null" ]; then
+            echo "Could not find Kanban status value: $PROJECT_STATUS_VALUE"
+            exit 1
+          fi
+
+          echo "project_id=$PROJECT_ID" >> "$GITHUB_OUTPUT"
+          echo "status_field_id=$STATUS_FIELD_ID" >> "$GITHUB_OUTPUT"
+          echo "status_option_id=$STATUS_OPTION_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Add PR to Kanban project
+        if: steps.linked_issues.outputs.open_issue_count != '0'
+        id: add_pr_to_project
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          PROJECT_ID: ${{ steps.project_data.outputs.project_id }}
+          PR_ID: ${{ github.event.pull_request.node_id }}
+        run: |
+          set -euo pipefail
+
+          ITEM_ID="$(
+            gh api graphql \
+              -F project="$PROJECT_ID" \
+              -F content="$PR_ID" \
+              -f query='
+                mutation($project: ID!, $content: ID!) {
+                  addProjectV2ItemById(input: {
+                    projectId: $project,
+                    contentId: $content
+                  }) {
+                    item {
+                      id
+                    }
+                  }
+                }
+              ' \
+              --jq '.data.addProjectV2ItemById.item.id'
+          )"
+
+          echo "item_id=$ITEM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Set Kanban status for PR
+        if: steps.linked_issues.outputs.open_issue_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          PROJECT_ID: ${{ steps.project_data.outputs.project_id }}
+          ITEM_ID: ${{ steps.add_pr_to_project.outputs.item_id }}
+          STATUS_FIELD_ID: ${{ steps.project_data.outputs.status_field_id }}
+          STATUS_OPTION_ID: ${{ steps.project_data.outputs.status_option_id }}
+        run: |
+          set -euo pipefail
+
+          gh api graphql \
+            -F project="$PROJECT_ID" \
+            -F item="$ITEM_ID" \
+            -F field="$STATUS_FIELD_ID" \
+            -F option="$STATUS_OPTION_ID" \
+            -f query='
+              mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project,
+                  itemId: $item,
+                  fieldId: $field,
+                  value: {
+                    singleSelectOptionId: $option
+                  }
+                }) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            '
+
+      - name: Add issue to Kanban project
+        if: steps.linked_issues.outputs.open_issue_count != '0'
+        id: add_issue_to_project
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          PROJECT_ID: ${{ steps.project_data.outputs.project_id }}
+          ISSUE_ID: ${{ steps.linked_issues.outputs.issue_id }}
+        run: |
+          set -euo pipefail
+
+          ISSUE_ITEM_ID="$(
+            gh api graphql \
+              -F project="$PROJECT_ID" \
+              -F content="$ISSUE_ID" \
+              -f query='
+                mutation($project: ID!, $content: ID!) {
+                  addProjectV2ItemById(input: {
+                    projectId: $project,
+                    contentId: $content
+                  }) {
+                    item {
+                      id
+                    }
+                  }
+                }
+              ' \
+              --jq '.data.addProjectV2ItemById.item.id'
+          )"
+
+          echo "issue_item_id=$ISSUE_ITEM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Set Kanban status for linked issue
+        if: steps.linked_issues.outputs.open_issue_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          PROJECT_ID: ${{ steps.project_data.outputs.project_id }}
+          ISSUE_ITEM_ID: ${{ steps.add_issue_to_project.outputs.issue_item_id }}
+          STATUS_FIELD_ID: ${{ steps.project_data.outputs.status_field_id }}
+          STATUS_OPTION_ID: ${{ steps.project_data.outputs.status_option_id }}
+        run: |
+          set -euo pipefail
+
+          gh api graphql \
+            -F project="$PROJECT_ID" \
+            -F item="$ISSUE_ITEM_ID" \
+            -F field="$STATUS_FIELD_ID" \
+            -F option="$STATUS_OPTION_ID" \
+            -f query='
+              mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $project,
+                  itemId: $item,
+                  fieldId: $field,
+                  value: {
+                    singleSelectOptionId: $option
+                  }
+                }) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            '
+
+      - name: Log association on PR
+        if: steps.linked_issues.outputs.open_issue_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_NUMBER: ${{ steps.linked_issues.outputs.issue_number }}
+          ISSUE_URL: ${{ steps.linked_issues.outputs.issue_url }}
+          ISSUE_TITLE: ${{ steps.linked_issues.outputs.issue_title }}
+          PROJECT_STATUS_VALUE: ${{ env.PROJECT_STATUS_VALUE }}
+        run: |
+          set -euo pipefail
+
+          gh pr comment "$PR_NUMBER" --body "Kanban log: This PR is linked to open issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+
+Issue: ${ISSUE_URL}
+
+The PR and linked issue were added to the GitHub Projects Kanban board and moved to status: ${PROJECT_STATUS_VALUE}."
